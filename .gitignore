@@ -1,0 +1,7 @@
+# Local test fixtures. Contains a personal photo -- deliberately not published,
+# and nothing in the app references it at runtime.
+samples/
+
+# OS cruft
+.DS_Store
+Thumbs.db

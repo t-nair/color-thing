@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recolor</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <h1>Recolor</h1>
+  <p class="tagline">Pick exact colors for a garment photo. Runs entirely in your browser.</p>
+</header>
+
+<main>
+
+  <!-- 1. Upload -->
+  <section id="screen-upload" class="screen">
+    <label id="dropzone" for="file-input">
+      <span class="drop-title">Drop a photo here</span>
+      <span class="drop-sub">or click to choose &middot; JPG or PNG, up to 10&nbsp;MB</span>
+      <input id="file-input" type="file" accept="image/jpeg,image/png" hidden>
+    </label>
+
+    <div class="field">
+      <span class="field-label">How many colors to find</span>
+      <div id="k-picker" class="seg" role="radiogroup" aria-label="Number of colors">
+        <button type="button" role="radio" data-k="1">1</button>
+        <button type="button" role="radio" data-k="2" aria-checked="true" class="on">2</button>
+        <button type="button" role="radio" data-k="3">3</button>
+        <button type="button" role="radio" data-k="4">4</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <span class="field-label">Photo type</span>
+      <div id="mode-picker" class="seg" role="radiogroup" aria-label="Photo type">
+        <button type="button" role="radio" data-mode="flat" aria-checked="true" class="on">Flat-lay</button>
+        <button type="button" role="radio" data-mode="model">On model</button>
+      </div>
+    </div>
+
+    <p id="upload-error" class="error" hidden></p>
+
+    <details class="tips">
+      <summary>For best results</summary>
+      <ul>
+        <li>Plain background, with the garment filling most of the frame.</li>
+        <li>Block colors, stripes and checks work well. Florals, gradients and tie-dye won't separate cleanly.</li>
+        <li>Uneven lighting is fine &mdash; color detection ignores it.</li>
+        <li>On model: the largest clothing item is recolored, and skin is excluded. Beige and camel garments are the hard case, since they sit in the same color range as skin.</li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- 2. Edit -->
+  <section id="screen-edit" class="screen" hidden>
+    <div class="workspace">
+      <div class="preview"><canvas id="preview-canvas"></canvas></div>
+      <div class="panel">
+        <h2>Detected colors</h2>
+        <div id="swatches" class="swatches"></div>
+        <p id="edit-note" class="note" hidden></p>
+        <div class="actions">
+          <button type="button" id="btn-recolor" class="primary">Recolor</button>
+          <button type="button" id="btn-cancel" class="ghost">Start over</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. Result -->
+  <section id="screen-result" class="screen" hidden>
+    <div class="workspace">
+      <div class="preview"><canvas id="result-canvas"></canvas></div>
+      <div class="panel">
+        <h2>Result</h2>
+        <label class="checkbox">
+          <input type="checkbox" id="legend-toggle" checked>
+          <span>Show hex legend</span>
+        </label>
+        <div class="actions">
+          <button type="button" id="btn-download" class="primary">Download PNG</button>
+          <button type="button" id="btn-back" class="ghost">Back to colors</button>
+          <button type="button" id="btn-restart" class="ghost">Start over</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Processing -->
+  <div id="processing" class="processing" hidden>
+    <div class="spinner"></div>
+    <p>Remaking file&hellip;</p>
+  </div>
+
+</main>
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
