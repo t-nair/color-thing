@@ -127,7 +127,7 @@ async function handleFile(file) {
   }
 
   state.targets = state.analysis.regions.map((r) => r.hex);
-  drawMasked(el.previewCanvas, state.source, state.analysis);
+  draw(el.previewCanvas, state.source);
   buildSwatches();
   el.editNote.textContent = state.analysis.warning || '';
   el.editNote.hidden = !state.analysis.warning;
@@ -152,26 +152,6 @@ function draw(canvas, imageData) {
   canvas.width = imageData.width;
   canvas.height = imageData.height;
   canvas.getContext('2d').putImageData(imageData, 0, 0);
-}
-
-// Fade everything outside the mask toward the page background, using the very
-// same alpha the recolor engine composites with -- so what stays crisp here is
-// exactly what will be repainted. Isolation is the step most likely to go wrong,
-// especially on model shots, and this makes it visible before committing.
-function drawMasked(canvas, imageData, analysis) {
-  const out = new ImageData(imageData.width, imageData.height);
-  out.data.set(imageData.data);
-  const d = out.data;
-  const bg = [250, 249, 247];
-  for (let i = 0; i < analysis.alpha.length; i++) {
-    const dim = 0.82 * (1 - analysis.alpha[i] / 255);
-    if (dim <= 0) continue;
-    const o = i * 4;
-    d[o] = Math.round(d[o] + (bg[0] - d[o]) * dim);
-    d[o + 1] = Math.round(d[o + 1] + (bg[1] - d[o + 1]) * dim);
-    d[o + 2] = Math.round(d[o + 2] + (bg[2] - d[o + 2]) * dim);
-  }
-  draw(canvas, out);
 }
 
 // --- editing ---------------------------------------------------------------

@@ -69,10 +69,14 @@ any static host.
    small: anything coarser erases fine patterns such as lace holes rather than
    cleaning them.
 
-4. **Recolor** (PRD 6.6) — each pixel keeps its own lightness structure, so
-   folds, shadows and stitching survive. The a/b channels are replaced with the
-   target colour scaled by how saturated that pixel was relative to its region,
-   so it isn't a flat fill. Regions the user didn't change stay bit-identical.
+4. **Recolor** (PRD 6.6) — the a/b channels are replaced with the target colour,
+   scaled by how saturated that pixel was relative to its region so it isn't a
+   flat fill. Lightness is **rescaled, not shifted**: diffuse shading is
+   reflectance × illumination, so preserving each pixel's luminance *ratio* to
+   the region anchor swaps the dye and leaves the lighting alone. Folds, shadows
+   and stitching survive, and the shading spread scales with the pick — narrow
+   for a dark colour, wide for a pale one. Regions the user didn't change stay
+   bit-identical.
 
 Everything runs at a working resolution capped at 1600px on the long edge
 (`MAX_EDGE` in `src/pipeline.js`), which is also the output size. Analysis and
@@ -83,17 +87,28 @@ region edges.
 
 PRD 6.6 says to leave each pixel's L "unchanged." Taken literally, recoloring a
 black garment to yellow keeps it black, which contradicts the headline promise
-of returning *those exact values*. Instead the region's median L is shifted onto
-the target's (`newL = L + (target.L - region.medianL)`), which is a rigid shift
-of the lightness histogram: relative shading is preserved exactly — the stated
-intent of 6.6 — while the region's median colour comes out as precisely the
-picked hex. Measured median ΔE against the picked colour is ~0.
+of returning *those exact values*. So lightness is remapped — but which pixel
+should come out as exactly the picked colour, and how the rest should follow,
+both matter:
 
-To get the literal PRD behaviour, drop the offset in `recolor()`:
+- **Anchor.** The pick is matched at the region's `SURFACE_PERCENTILE` (75th) of
+  lightness, not its median. Lightness constancy means people read a surface's
+  colour from its lit areas and discount shadow, so anchoring on the median made
+  every pick land visibly lighter than asked for. The same statistic drives the
+  detected swatch, so the round trip stays exact.
+- **Shape.** `newY = Y(target) × (Y(pixel) / Y(anchor))`, i.e. proportional in
+  luminance rather than an additive shift of L\*. An additive shift held the
+  spread constant no matter how dark the pick was, leaving highlights ~14 L\*
+  above a dark pick.
 
-```js
-const newL = L;
-```
+Measured on the sample photo: the lit surface reproduces the pick to within
+0.33 L\* across picks from `#1C2A52` to `#E8E2D5`, and highlight overshoot fell
+from a flat +13.8 L\* to +2.7 (dark picks) through +8.3 (near-white).
+
+Known gap: specular highlights are physically *additive*, so scaling luminance
+compresses them too — satin and sequins lose some sparkle, and very pale picks
+can hit the L\*=100 rail (7.3% of pixels for `#E8E2D5`). A highlight roll-off
+would fix both.
 
 ## Known limits (PRD 10)
 

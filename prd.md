@@ -162,6 +162,8 @@ Primary use case: a designer, small apparel brand, or hobbyist wants to preview 
 
 - For each region mask, preserve the original L (lightness) channel per pixel unchanged, this retains folds, shadows, highlights, and stitching detail
 
+  > **Amended after v1 user testing.** Taken literally this makes the picked colour a no-op on dark garments. Lightness is instead rescaled proportionally in luminance (`newY = Y(target) × Y(pixel) / Y(anchor)`), anchored at the 75th lightness percentile rather than the median. Users reported picks rendering lighter than chosen: an additive shift held the shading spread constant regardless of how dark the pick was, and anchoring on the median put the pick below the lit areas that people actually read as the garment's colour. See README, "One deliberate deviation from the PRD."
+
 - Replace a/b channels with the target hex's Lab a/b values (scaled to preserve local lightness variation ratio rather than flat-filling)
 
 - Convert back to RGB and composite into the full image
