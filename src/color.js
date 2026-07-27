@@ -48,6 +48,17 @@ export function labToRgb(L, a, b) {
   return [encode(rl), encode(gl), encode(bl)];
 }
 
+// Relative luminance (Y/Yn) for a given L*, and back. Uses the real piecewise
+// CIE curve: the naive ((L+16)/116)^3 diverges below L*~8, which is exactly
+// where garment shadows sit.
+export function lToY(L) {
+  return finv((L + 16) / 116);
+}
+
+export function yToL(Y) {
+  return 116 * f(Y) - 16;
+}
+
 export function rgbToHex(r, g, b) {
   return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
 }

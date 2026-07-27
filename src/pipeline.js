@@ -1,7 +1,7 @@
 // Classical-CV pipeline: background removal -> chrominance clustering ->
 // mask cleanup -> lightness-preserving recolor. Deterministic, no model calls.
 
-import { rgbToLab, labToRgb, labToHex, hexToLab } from './color.js';
+import { rgbToLab, labToRgb, labToHex, hexToLab, lToY, yToL } from './color.js';
 
 // Everything (analysis and output) runs at this resolution so the label map and
 // the pixels always line up -- no upsampling, no blocky region edges.
@@ -12,6 +12,13 @@ export const BG = -1; // label for background pixels
 // How much high-pass lightness counts against chrominance when clustering.
 // 0 reproduces the original chrominance-only behaviour.
 const HP_WEIGHT = 0.8;
+
+// Which lightness percentile within a region counts as "the colour of the
+// garment". Lightness constancy means people read a surface's colour from its
+// lit areas and discount shadow, so anchoring on the median made picks land
+// visibly lighter than asked for. This is the one value that decides both the
+// detected swatch and what the recolor engine matches.
+const SURFACE_PERCENTILE = 0.75;
 
 // --- deterministic RNG (same photo + same k => same clusters, every run) ---
 function rng(seed) {
@@ -43,12 +50,18 @@ function otsu(hist, total) {
   return thr;
 }
 
-function median(values) {
+function percentile(values, p) {
   const a = Float64Array.from(values).sort();
   const n = a.length;
   if (!n) return 0;
-  return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
+  if (p <= 0) return a[0];
+  if (p >= 1) return a[n - 1];
+  const idx = (n - 1) * p;
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  return lo === hi ? a[lo] : a[lo] + (a[hi] - a[lo]) * (idx - lo);
 }
+
+const median = (values) => percentile(values, 0.5);
 
 // Binary morphology with a square structuring element. A square is separable,
 // so this runs as a horizontal pass then a vertical one -- O(r) per pixel
@@ -614,8 +627,10 @@ export function analyze(imageData, k, { onModel = false } = {}) {
   labels = despeckle(labels, w, h, k, 1, 1);
   labels = dropSmallRegions(labels, w, h, k, Math.max(12, Math.round(garmentCount * 0.0002)));
 
-  // Per-region stats. Median L renders a presentable hex; median chroma is the
-  // reference the recolor engine scales against.
+  // Per-region stats. The anchor lightness renders the swatch and is what the
+  // recolor engine matches the pick to; anchor chroma is the reference it
+  // scales saturation against. Both come from the same percentile so the
+  // anchored pixel reproduces the picked colour exactly, not just its lightness.
   const byRegion = Array.from({ length: k }, () => ({ L: [], C: [], count: 0 }));
   const statStride = Math.max(1, Math.floor(garmentCount / 30000));
   for (let i = 0; i < n; i++) {
@@ -634,14 +649,14 @@ export function analyze(imageData, k, { onModel = false } = {}) {
   const kept = [];
   for (let c = 0; c < k; c++) {
     if (byRegion[c].count === 0) continue; // collapsed cluster: drop it
-    const medL = median(byRegion[c].L);
+    const anchorL = percentile(byRegion[c].L, SURFACE_PERCENTILE);
     kept.push({
       cluster: c,
-      // High-pass lightness steers assignment only; the displayed colour is
-      // still the cluster's median L with its centroid chrominance (PRD 6.3).
-      hex: labToHex(medL, cent[c][0], cent[c][1]),
-      medianL: medL,
-      medianC: median(byRegion[c].C),
+      // High-pass lightness steers assignment only; the displayed colour is the
+      // cluster's lit-surface lightness with its centroid chrominance (PRD 6.3).
+      hex: labToHex(anchorL, cent[c][0], cent[c][1]),
+      anchorL,
+      anchorC: percentile(byRegion[c].C, SURFACE_PERCENTILE),
       a: cent[c][0],
       b: cent[c][1],
       count: byRegion[c].count,
@@ -675,8 +690,13 @@ export function analyze(imageData, k, { onModel = false } = {}) {
  * 6.6 Recolor engine. Each pixel keeps its own lightness structure (folds,
  * shadows, stitching); a/b are replaced with the target colour, scaled by how
  * saturated that pixel was relative to its region so it isn't a flat fill.
- * The region's median lightness is shifted onto the target's so the picked hex
- * is actually what comes out.
+ *
+ * Lightness is rescaled rather than shifted. Diffuse shading is
+ * reflectance x illumination, so preserving each pixel's *ratio* to the region
+ * anchor swaps the dye while leaving the lighting alone. Shifting L* instead
+ * kept the absolute spread constant no matter how dark the pick was, which left
+ * highlights sitting ~14 L* above a dark pick -- and since people read a
+ * surface's colour from its lit areas, the result looked lighter than asked for.
  */
 export function recolor(imageData, analysis, targetHexes) {
   const { width: w, height: h } = analysis;
@@ -689,7 +709,18 @@ export function recolor(imageData, analysis, targetHexes) {
     const hex = targetHexes[i];
     if (!hex || hex.toUpperCase() === reg.hex.toUpperCase()) return null; // unchanged: leave pixels alone
     const lab = hexToLab(hex);
-    return lab ? { L: lab[0], a: lab[1], b: lab[2], medianL: reg.medianL, medianC: reg.medianC } : null;
+    if (!lab) return null;
+    const anchorY = lToY(reg.anchorL);
+    return {
+      L: lab[0], a: lab[1], b: lab[2],
+      anchorL: reg.anchorL,
+      anchorC: reg.anchorC,
+      targetY: lToY(lab[0]),
+      anchorY,
+      // An almost-black region makes the luminance ratio explode; fall back to
+      // the additive shift there, where the two models barely differ anyway.
+      proportional: anchorY > 1e-4,
+    };
   });
   if (targets.every((t) => t === null)) return out;
 
@@ -705,8 +736,10 @@ export function recolor(imageData, analysis, targetHexes) {
     const o = i * 4;
     const [L, a, b] = rgbToLab(src[o], src[o + 1], src[o + 2]);
     const chroma = Math.hypot(a, b);
-    const ratio = t.medianC > 2 ? Math.min(1.6, chroma / t.medianC) : 1;
-    const newL = Math.max(0, Math.min(100, L + (t.L - t.medianL)));
+    const ratio = t.anchorC > 2 ? Math.min(1.6, chroma / t.anchorC) : 1;
+    const newL = Math.max(0, Math.min(100, t.proportional
+      ? yToL(t.targetY * (lToY(L) / t.anchorY))
+      : L + (t.L - t.anchorL)));
     const [nr, ng, nb] = labToRgb(newL, t.a * ratio, t.b * ratio);
 
     dst[o] = Math.round(src[o] + (nr - src[o]) * alpha);
