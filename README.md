@@ -78,22 +78,31 @@ started, the same session runs on the main thread.
    then cut away. Skin classification does the removing — hue in the Lab a/b
    plane (permissive on lightness, since across skin tones melanin moves L and
    chroma far more than hue) combined with smoothness, because beige and camel
-   garments sit in the skin gamut and only texture tells knit from arm. Sobel
-   edges are the supporting cue: they make the cut land on the real
-   neckline/cuff/hem and stop the garment bleeding into hair or trousers. The
-   largest surviving component is the garment. If that comes out under 10% of
-   the person, the detector has eaten a skin-toned garment, so it falls back to
-   the whole subject and returns a `warning`.
+   garments sit in the skin gamut and only texture tells knit from arm. The
+   person's skin tone is estimated from large connected skin areas only, and
+   small patches are dropped from the final skin mask: real skin forms a few
+   big regions (face, neck, hands), while skin-toned false positives on fabric
+   are scattered, and letting them into the estimate drags it toward the
+   garment. Sobel edges are the supporting cue: they make the cut land on the
+   real neckline/cuff/hem and stop the garment bleeding into hair or trousers.
+   A knit's own stitch gradients can dice it into confetti, though, so if the
+   largest piece left after the edge cut is under 40% of what the cut kept, the
+   cut is dropped and the garment is separated on skin alone. The largest
+   surviving component is the garment. If that comes out under 10% of the
+   person, it falls back to the largest non-skin component — never the whole
+   subject, which would recolor the model — and returns a `warning`.
 
-2. **Identification** (PRD 6.3) — k-means with `k = X` on `(a, b, λ·hp)`, where
-   `hp = L − localMeanL`. Chrominance alone is lighting-invariant but cannot
-   separate tone-on-tone colours — gold yarn against a brown pattern, grey
-   against charcoal — which differ almost entirely in lightness. Subtracting a
-   *local* mean strips the smooth lighting gradient while keeping
-   high-frequency pattern contrast, so both properties hold at once. `λ = 0`
-   (`HP_WEIGHT`) reduces to chrominance-only, and on a solid-colour garment
-   `hp ≈ 0` everywhere. Seeding is k-means++ with a fixed seed, so the same
-   photo and X always give the same regions.
+2. **Identification** (PRD 6.3) — k-means with `k = X` on chrominance `(a, b)`
+   only, which is lighting-invariant. Seeding is k-means++ with a fixed seed,
+   so the same photo and X always give the same regions.
+
+   The clusterer also accepts a third feature, `λ·hp` with
+   `hp = L − localMeanL` (`HP_WEIGHT` in `src/pipeline.js`), meant to separate
+   tone-on-tone colours — gold yarn against a brown pattern, grey against
+   charcoal — that differ almost entirely in lightness. It is set to `λ = 0`:
+   at 0.8 it pulled skin into the garment's main cluster on real photos, so
+   faces and necks got recolored, and pattern separation got worse rather than
+   better. Raise it only with a side-by-side render showing it helps.
 
 3. **Cleanup** (PRD 6.4) — a majority filter over the label map (the
    multi-label equivalent of morphological opening/closing; unlike per-mask
@@ -153,6 +162,8 @@ would fix both.
   *smooth* fabric in a skin tone stays genuinely ambiguous to a non-AI method.
   Long hair over the shoulders against a similar-toned top can also merge, and
   skin visible through an open-knit neckline will partly survive.
+- Tone-on-tone colours (same hue, different lightness) won't separate, since
+  clustering is chrominance-only — see `HP_WEIGHT` above.
 - Busy prints, florals and gradients won't reduce to K flat regions.
 - A garment colour very close to the background is the hardest case for
   isolation; the threshold retry helps but isn't a guarantee.

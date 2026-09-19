@@ -10,8 +10,14 @@ export const MAX_EDGE = 1600;
 export const BG = -1; // label for background pixels
 
 // How much high-pass lightness counts against chrominance when clustering.
-// 0 reproduces the original chrominance-only behaviour.
-const HP_WEIGHT = 0.8;
+//
+// Set to 0: clustering is chrominance-only, as PRD 6.3/13 specify. This was
+// tried at 0.8 to separate tone-on-tone colours (gold yarn vs brown pattern)
+// and reverted -- on real photos it pulled skin out of the shadow-toned cluster
+// into the garment's main cluster, so faces and necks got recoloured, and it
+// made pattern separation worse rather than better. Raise it only with a
+// side-by-side render to prove it helps.
+const HP_WEIGHT = 0;
 
 // Which lightness percentile within a region counts as "the colour of the
 // garment". Lightness constancy means people read a surface's colour from its
@@ -124,6 +130,18 @@ function components(mask, w, h, comp) {
     sizes.push(size);
   }
   return sizes;
+}
+
+// Keep only components at least minArea in size. Real skin forms a few big
+// regions (face, neck, hands); colour false-positives on fabric are scattered.
+function keepLargeComponents(mask, w, h, minArea) {
+  const comp = new Int32Array(mask.length);
+  const sizes = components(mask, w, h, comp);
+  const out = new Uint8Array(mask.length);
+  for (let i = 0; i < mask.length; i++) {
+    if (comp[i] !== -1 && sizes[comp[i]] >= minArea) out[i] = 1;
+  }
+  return out;
 }
 
 function largestComponent(mask, w, h) {
@@ -301,12 +319,20 @@ function skinMask(lab, person, texture, textureThr, w, h) {
   }
   if (seedCount < personCount * 0.02) return null;
 
-  // Tighten onto this person's actual tone rather than trusting the fixed window.
+  // Estimate the tone from coherent skin areas only. A skin-toned garment puts
+  // scattered fabric pixels in the seed, and letting those contaminate the
+  // median drags it toward the garment -- after which the tightened test
+  // matches even more fabric.
+  const bigSeed = keepLargeComponents(seed, w, h, Math.round(personCount * 0.01));
+  let bigCount = 0;
+  for (let i = 0; i < n; i++) bigCount += bigSeed[i];
+  const toneFrom = bigCount > personCount * 0.01 ? bigSeed : seed;
+
   const Ls = [], as = [], bs = [];
-  const stride = Math.max(1, Math.floor(seedCount / 5000));
+  const stride = Math.max(1, Math.floor((bigCount || seedCount) / 5000));
   let s = 0;
   for (let i = 0; i < n; i++) {
-    if (seed[i] && s++ % stride === 0) { Ls.push(lab.L[i]); as.push(lab.a[i]); bs.push(lab.b[i]); }
+    if (toneFrom[i] && s++ % stride === 0) { Ls.push(lab.L[i]); as.push(lab.a[i]); bs.push(lab.b[i]); }
   }
   const mL = median(Ls), mA = median(as), mB = median(bs);
 
@@ -318,7 +344,8 @@ function skinMask(lab, person, texture, textureThr, w, h) {
     if (Math.abs(lab.L[i] - mL) > 35) continue;
     out[i] = 1;
   }
-  return out;
+  // Drop the scattered fabric patches, keeping the coherent skin regions.
+  return keepLargeComponents(out, w, h, Math.round(personCount * 0.01));
 }
 
 /**
@@ -347,14 +374,25 @@ export function isolate(lab, w, h, onModel) {
   const edgeThr = otsuOver(grad, person, w, h) * 1.6;
 
   const skinWide = morph(skin, w, h, r * 2, true);
-  const candidate = new Uint8Array(n);
+  const bare = new Uint8Array(n); // skin removed
+  const cut = new Uint8Array(n);  // ...plus strong edges used as separators
   for (let i = 0; i < n; i++) {
-    candidate[i] = person[i] && !skinWide[i] && grad[i] < edgeThr ? 1 : 0;
+    const keep = person[i] && !skinWide[i] ? 1 : 0;
+    bare[i] = keep;
+    cut[i] = keep && grad[i] < edgeThr ? 1 : 0;
   }
 
-  // Largest surviving piece is the garment; hair, trousers and accessories are
-  // now separate components.
-  const picked = largestComponent(open(candidate, w, h, r), w, h);
+  const tally = (m) => { let t = 0; for (let i = 0; i < n; i++) t += m[i]; return t; };
+
+  // Edges separate the garment from hair and trousers on smooth fabric, but a
+  // knit's own stitch gradients exceed any global threshold and dice it into
+  // confetti. If the largest surviving piece is only a crumb, the cut did more
+  // harm than good -- drop it and separate on skin alone. Same retry shape as
+  // the background flood fill above.
+  let picked = largestComponent(open(cut, w, h, r), w, h);
+  if (tally(picked) < tally(cut) * 0.4) {
+    picked = largestComponent(open(bare, w, h, r), w, h);
+  }
 
   // Give back exactly what the cuts took -- dilating by the same radius the skin
   // mask was widened by -- but never back into skin.
@@ -368,11 +406,13 @@ export function isolate(lab, w, h, onModel) {
 
   let count = 0, personCount = 0;
   for (let i = 0; i < n; i++) { count += grown[i]; personCount += person[i]; }
+
   if (count < personCount * 0.1) {
-    // The skin detector ate the garment -- a smooth fabric in a skin tone.
+    // Couldn't find one dominant garment. Fall back to everything that isn't
+    // skin -- never to the bare person mask, which would paint the model.
     return {
-      mask: person,
-      warning: "Couldn't tell the garment apart from skin, so the whole subject is selected. This happens with beige and camel colours on a model.",
+      mask: largestComponent(bare, w, h),
+      warning: "Couldn't pick out a single garment, so everything that isn't skin is selected. Check the result before downloading.",
     };
   }
   return { mask: largestComponent(grown, w, h), warning: null };
@@ -595,9 +635,11 @@ export function analyze(imageData, k, { onModel = false } = {}) {
   // distinguishes tone-on-tone colours (gold yarn vs brown pattern, grey vs
   // charcoal). On a solid-colour garment this is ~0 everywhere, so flat-lay
   // behaviour is unchanged.
-  const localL = boxMean(lab.L, mask, w, h, Math.max(4, Math.round(Math.min(w, h) * 0.05)));
   const hp = new Float32Array(n);
-  for (let i = 0; i < n; i++) hp[i] = (lab.L[i] - localL[i]) * HP_WEIGHT;
+  if (HP_WEIGHT > 0) {
+    const localL = boxMean(lab.L, mask, w, h, Math.max(4, Math.round(Math.min(w, h) * 0.05)));
+    for (let i = 0; i < n; i++) hp[i] = (lab.L[i] - localL[i]) * HP_WEIGHT;
+  }
 
   // Fit on a subsample; assign every garment pixel afterwards.
   const stride = Math.max(1, Math.floor(garmentCount / 20000));
