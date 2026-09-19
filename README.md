@@ -24,7 +24,43 @@ any static host.
 | `styles.css` | All styling |
 | `src/color.js` | sRGB ↔ CIE Lab (D65) and hex helpers |
 | `src/pipeline.js` | The CV pipeline — isolation, clustering, cleanup, recolor |
-| `src/app.js` | UI wiring, legend rendering, PNG export |
+| `src/store.js` | Central store: state, reducer, `subscribe`/`dispatch`, `watch` |
+| `src/cv-service.js` | CV observers (analysis, recolor) and the worker client |
+| `src/cv.worker.js` | Web Worker that runs the pipeline off the main thread |
+| `src/cv-session.js` | Keeps one photo's analysis between analyze and recolor calls |
+| `src/color-editor.js` | Swatch rows; every edit dispatches `UPDATE_TARGET` |
+| `src/canvas-renderer.js` | Paints `renderBuffer` to the preview canvas |
+| `src/app.js` | Bootstrapping, screens, upload, legend rendering, PNG export |
+
+## State and data flow
+
+The UI and the CV math never call each other. All state lives in one store
+(`src/store.js`); components subscribe to the slice they care about and
+dispatch results back:
+
+| Observer | Watches | Does | Dispatches |
+|---|---|---|---|
+| CV analysis | `rawImage` | Forward Lab, isolation, clustering (in the worker) | `ANALYSIS_COMPLETE` |
+| CV recolor | `targets` | Pixel swap + inverse Lab over the existing mask (in the worker) | `RENDER_BUFFER_READY` |
+| Color editor | `sourceSwatches` | Builds a row per detected colour | `UPDATE_TARGET` |
+| Canvas renderer | `renderBuffer` | `putImageData` to the preview canvas | — |
+
+State: `rawImage`, `maskData` (feathered garment alpha), `sourceSwatches`,
+`targetHex` (the most recent pick) and `renderBuffer`, plus:
+
+- `targets` — one pick per swatch. Regions recolor independently, so a single
+  `targetHex` isn't enough to render from; `UPDATE_TARGET` takes
+  `{ index, hex }` and sets both. Recolor watches `targets` rather than
+  `targetHex`, since the same hex picked for a second region must still render.
+- `settings` (`{ k, onModel }`, via `SET_OPTIONS`), `analysisMeta` (per-swatch
+  share and the isolation warning), `status` and `error` (`PIPELINE_ERROR`).
+
+The label map and per-region anchors that recolor needs stay inside the worker
+(`cv-session.js`) — the store only ever holds what the UI renders. Each new
+photo bumps a generation counter, so results for a replaced photo are dropped,
+and recolor keeps at most one request in flight, coalescing a colour-picker
+drag into a single rerun with the latest picks. If a module worker can't be
+started, the same session runs on the main thread.
 
 ## How the pipeline works
 
@@ -139,4 +175,5 @@ On-model mode adds a Sobel pass, a box mean, extra morphology and component
 labeling, so it will be slower than the above and needs re-measuring against the
 PRD's 2 s budget. If it overruns, lower `MAX_EDGE` for the on-model path only.
 The majority filter and the flood fill dominate; both are already
-separable/linear, so the step after that would be moving analysis to a Worker.
+separable/linear. Analysis and recolor now run in a Web Worker, so these times
+no longer block the UI, though they still bound how quickly results arrive.
