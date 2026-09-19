@@ -2,6 +2,7 @@
 // mask cleanup -> lightness-preserving recolor. Deterministic, no model calls.
 
 import { rgbToLab, labToRgb, labToHex, hexToLab, lToY, yToL } from './color.js';
+import { featherMask, estimateForeground } from './feather.js';
 
 // Everything (analysis and output) runs at this resolution so the label map and
 // the pixels always line up -- no upsampling, no blocky region edges.
@@ -602,13 +603,31 @@ function dropSmallRegions(labels, w, h, k, minArea) {
   return out;
 }
 
+// Feathering can put partial alpha just outside the binary mask, where every
+// pixel is BG and recolor would skip it. Give those pixels the region of the
+// nearest garment pixel (breadth-first, 4-connected, alpha > 0 only).
+function extendLabels(labels, alpha, w, h) {
+  const n = w * h;
+  const queue = new Int32Array(n);
+  let head = 0, tail = 0;
+  for (let i = 0; i < n; i++) if (labels[i] !== BG) queue[tail++] = i;
+  while (head < tail) {
+    const p = queue[head++], x = p % w, l = labels[p];
+    if (x > 0 && labels[p - 1] === BG && alpha[p - 1]) { labels[p - 1] = l; queue[tail++] = p - 1; }
+    if (x < w - 1 && labels[p + 1] === BG && alpha[p + 1]) { labels[p + 1] = l; queue[tail++] = p + 1; }
+    if (p >= w && labels[p - w] === BG && alpha[p - w]) { labels[p - w] = l; queue[tail++] = p - w; }
+    if (p < n - w && labels[p + w] === BG && alpha[p + w]) { labels[p + w] = l; queue[tail++] = p + w; }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
  * Analyse an ImageData: isolate the garment and split it into k colour regions.
- * Returns the label map, a feathered garment alpha, and per-region stats.
+ * Returns the label map, an edge-aware garment alpha (with labels extended to
+ * cover it), the estimated garment colour at edge pixels, and per-region stats.
  */
 export function analyze(imageData, k, { onModel = false } = {}) {
   const { width: w, height: h, data } = imageData;
@@ -711,21 +730,18 @@ export function analyze(imageData, k, { onModel = false } = {}) {
   for (let i = 0; i < n; i++) if (labels[i] !== BG) labels[i] = remap[labels[i]];
   const regions = kept.map(({ cluster, ...rest }) => rest);
 
-  // Feathered garment edge (3x3 box blur of the binary mask) for compositing.
+  // Edge-aware alpha: follows the photo's colour edge rather than the binary
+  // mask's staircase (see src/feather.js).
+  const soft = featherMask(mask, lab, w, h);
   const alpha = new Uint8Array(n);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let sum = 0, cnt = 0;
-      for (let yy = Math.max(0, y - 1); yy <= Math.min(h - 1, y + 1); yy++) {
-        for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) {
-          sum += mask[yy * w + xx]; cnt++;
-        }
-      }
-      alpha[y * w + x] = Math.round((sum / cnt) * 255);
-    }
-  }
+  for (let i = 0; i < n; i++) alpha[i] = Math.round(soft[i] * 255);
+  extendLabels(labels, alpha, w, h);
 
-  return { width: w, height: h, labels, alpha, regions, garmentCount, warning };
+  // The garment's own colour at partially covered edge pixels, so recolor
+  // doesn't carry the background into the new colour.
+  const fg = estimateForeground(soft, data, w, h);
+
+  return { width: w, height: h, labels, alpha, fg, regions, garmentCount, warning };
 }
 
 /**
@@ -766,6 +782,9 @@ export function recolor(imageData, analysis, targetHexes) {
   });
   if (targets.every((t) => t === null)) return out;
 
+  // Edge pixels are recolored from the garment's estimated colour, then blended
+  // back over the photo by alpha. Elsewhere fg is the photo itself.
+  const fg = analysis.fg ?? src;
   const n = w * h;
   for (let i = 0; i < n; i++) {
     const label = analysis.labels[i];
@@ -776,7 +795,7 @@ export function recolor(imageData, analysis, targetHexes) {
     if (alpha <= 0) continue;
 
     const o = i * 4;
-    const [L, a, b] = rgbToLab(src[o], src[o + 1], src[o + 2]);
+    const [L, a, b] = rgbToLab(fg[o], fg[o + 1], fg[o + 2]);
     const chroma = Math.hypot(a, b);
     const ratio = t.anchorC > 2 ? Math.min(1.6, chroma / t.anchorC) : 1;
     const newL = Math.max(0, Math.min(100, t.proportional
@@ -784,9 +803,9 @@ export function recolor(imageData, analysis, targetHexes) {
       : L + (t.L - t.anchorL)));
     const [nr, ng, nb] = labToRgb(newL, t.a * ratio, t.b * ratio);
 
-    dst[o] = Math.round(src[o] + (nr - src[o]) * alpha);
-    dst[o + 1] = Math.round(src[o + 1] + (ng - src[o + 1]) * alpha);
-    dst[o + 2] = Math.round(src[o + 2] + (nb - src[o + 2]) * alpha);
+    dst[o] = Math.round(src[o] + (nr - fg[o]) * alpha);
+    dst[o + 1] = Math.round(src[o + 1] + (ng - fg[o + 1]) * alpha);
+    dst[o + 2] = Math.round(src[o + 2] + (nb - fg[o + 2]) * alpha);
   }
   return out;
 }
