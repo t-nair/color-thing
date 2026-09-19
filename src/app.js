@@ -1,5 +1,8 @@
-import { analyze, recolor, MAX_EDGE } from './pipeline.js';
-import { isValidHex } from './color.js';
+import { store, watch, ActionTypes } from './store.js';
+import { startCvPipeline } from './cv-service.js';
+import { mountColorEditor } from './color-editor.js';
+import { mountCanvasRenderer } from './canvas-renderer.js';
+import { MAX_EDGE } from './pipeline.js';
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const MIN_EDGE = 400; // below this we warn about resolution
@@ -26,14 +29,15 @@ const el = {
   processing: $('processing'),
 };
 
-const state = {
-  k: 2,
-  onModel: false,   // on-model photos need the model cut away first
-  source: null,     // ImageData at working resolution
-  analysis: null,   // { labels, alpha, regions, ... }
-  targets: [],      // hex per region
-  recolored: null,  // ImageData without legend
-};
+// --- wiring ----------------------------------------------------------------
+// This file owns screens, upload and export. Everything else reacts to the
+// store: the CV pipeline, the colour editor and the preview canvas.
+
+startCvPipeline();
+mountCanvasRenderer(el.previewCanvas);
+mountColorEditor(el.swatches, {
+  onValidity: (ok) => { $('btn-recolor').disabled = !ok; },
+});
 
 // --- screens ---------------------------------------------------------------
 
@@ -41,19 +45,38 @@ function show(name) {
   for (const [key, node] of Object.entries(el.screens)) node.hidden = key !== name;
 }
 
-async function withSpinner(work) {
-  el.processing.hidden = false;
-  const started = performance.now();
-  try {
-    // Yield once so the spinner paints before the synchronous pipeline runs.
-    await new Promise((r) => setTimeout(r, 30));
-    return await work();
-  } finally {
-    const rest = MIN_SPINNER_MS - (performance.now() - started);
-    if (rest > 0) await new Promise((r) => setTimeout(r, rest));
-    el.processing.hidden = true;
+// Analysis progress. The spinner holds for a minimum time once shown.
+let spinnerShownAt = 0;
+let spinnerTimer = 0;
+watch((s) => s.status === 'analyzing', (analyzing) => {
+  clearTimeout(spinnerTimer);
+  if (analyzing) {
+    spinnerShownAt = performance.now();
+    el.processing.hidden = false;
+  } else {
+    const rest = MIN_SPINNER_MS - (performance.now() - spinnerShownAt);
+    spinnerTimer = setTimeout(() => { el.processing.hidden = true; }, Math.max(0, rest));
   }
-}
+});
+
+// Analysis finished: move on to editing.
+watch((s) => s.sourceSwatches, (swatches, state) => {
+  if (!swatches.length) return;
+  const warning = state.analysisMeta?.warning;
+  el.editNote.textContent = warning || '';
+  el.editNote.hidden = !warning;
+  show('edit');
+});
+
+watch((s) => s.error, (error, state) => {
+  if (!error) return;
+  if (state.sourceSwatches.length) {
+    el.editNote.textContent = error;
+    el.editNote.hidden = false;
+  } else {
+    fail(error);
+  }
+});
 
 // --- input -----------------------------------------------------------------
 
@@ -70,8 +93,8 @@ function segmented(container, attr, onPick) {
   });
 }
 
-segmented(el.kPicker, 'k', (v) => { state.k = Number(v); });
-segmented(el.modePicker, 'mode', (v) => { state.onModel = v === 'model'; });
+segmented(el.kPicker, 'k', (v) => store.dispatch(ActionTypes.SET_OPTIONS, { k: Number(v) }));
+segmented(el.modePicker, 'mode', (v) => store.dispatch(ActionTypes.SET_OPTIONS, { onModel: v === 'model' }));
 
 el.fileInput.addEventListener('change', () => {
   if (el.fileInput.files[0]) handleFile(el.fileInput.files[0]);
@@ -115,23 +138,9 @@ async function handleFile(file) {
     fail(`Heads up: this image is only ${bitmap.width}×${bitmap.height}. Results are better above ${MIN_EDGE}px.`);
   }
 
-  state.source = toImageData(bitmap);
+  const image = toImageData(bitmap);
   bitmap.close?.();
-
-  try {
-    await withSpinner(async () => {
-      state.analysis = analyze(state.source, state.k, { onModel: state.onModel });
-    });
-  } catch (err) {
-    return fail(err.message || 'Something went wrong reading that image.');
-  }
-
-  state.targets = state.analysis.regions.map((r) => r.hex);
-  draw(el.previewCanvas, state.source);
-  buildSwatches();
-  el.editNote.textContent = state.analysis.warning || '';
-  el.editNote.hidden = !state.analysis.warning;
-  show('edit');
+  store.dispatch(ActionTypes.LOAD_IMAGE, image);
 }
 
 // Downscale to the working resolution once; every later stage uses this size,
@@ -148,78 +157,10 @@ function toImageData(bitmap) {
   return ctx.getImageData(0, 0, w, h);
 }
 
-function draw(canvas, imageData) {
-  canvas.width = imageData.width;
-  canvas.height = imageData.height;
-  canvas.getContext('2d').putImageData(imageData, 0, 0);
-}
-
 // --- editing ---------------------------------------------------------------
 
-function buildSwatches() {
-  el.swatches.replaceChildren();
-  state.analysis.regions.forEach((region, i) => {
-    const row = document.createElement('div');
-    row.className = 'swatch';
-
-    const picker = document.createElement('input');
-    picker.type = 'color';
-    picker.value = region.hex.toLowerCase();
-    picker.setAttribute('aria-label', `Color ${i + 1}`);
-
-    const body = document.createElement('div');
-    body.className = 'swatch-body';
-
-    const name = document.createElement('span');
-    name.className = 'swatch-name';
-    name.textContent = `Color ${i + 1} · ${share(region)}`;
-
-    const text = document.createElement('input');
-    text.type = 'text';
-    text.value = region.hex;
-    text.spellcheck = false;
-    text.setAttribute('aria-label', `Hex for color ${i + 1}`);
-
-    picker.addEventListener('input', () => {
-      const hex = picker.value.toUpperCase();
-      state.targets[i] = hex;
-      text.value = hex;
-      text.classList.remove('invalid');
-      validate();
-    });
-
-    text.addEventListener('input', () => {
-      const raw = text.value.trim();
-      const ok = isValidHex(raw);
-      text.classList.toggle('invalid', !ok);
-      if (ok) {
-        const hex = (raw.startsWith('#') ? raw : '#' + raw).toUpperCase();
-        state.targets[i] = hex;
-        picker.value = hex.toLowerCase();
-      }
-      validate();
-    });
-
-    body.append(name, text);
-    row.append(picker, body);
-    el.swatches.append(row);
-  });
-  validate();
-}
-
-function share(region) {
-  return `${Math.round((region.count / state.analysis.garmentCount) * 100)}% of garment`;
-}
-
-function validate() {
-  const ok = [...el.swatches.querySelectorAll('input[type="text"]')].every((i) => isValidHex(i.value));
-  $('btn-recolor').disabled = !ok;
-}
-
-$('btn-recolor').addEventListener('click', async () => {
-  await withSpinner(async () => {
-    state.recolored = recolor(state.source, state.analysis, state.targets);
-  });
+// The preview is already live, so this only moves to the export screen.
+$('btn-recolor').addEventListener('click', () => {
   renderResult();
   show('result');
 });
@@ -230,8 +171,7 @@ $('btn-restart').addEventListener('click', restart);
 el.legendToggle.addEventListener('change', renderResult);
 
 function restart() {
-  state.source = state.analysis = state.recolored = null;
-  state.targets = [];
+  store.dispatch(ActionTypes.RESET);
   el.fileInput.value = '';
   el.uploadError.hidden = true;
   el.editNote.hidden = true;
@@ -241,12 +181,14 @@ function restart() {
 // --- 6.8 output ------------------------------------------------------------
 
 function composite(withLegend) {
+  const { renderBuffer, rawImage, targets } = store.getState();
+  const image = renderBuffer ?? rawImage; // no picks yet: the photo is the result
   const canvas = document.createElement('canvas');
-  canvas.width = state.recolored.width;
-  canvas.height = state.recolored.height;
+  canvas.width = image.width;
+  canvas.height = image.height;
   const ctx = canvas.getContext('2d');
-  ctx.putImageData(state.recolored, 0, 0);
-  if (withLegend) drawLegend(ctx, canvas.width, canvas.height, state.targets);
+  ctx.putImageData(image, 0, 0);
+  if (withLegend) drawLegend(ctx, canvas.width, canvas.height, targets);
   return canvas;
 }
 
@@ -296,6 +238,10 @@ function renderResult() {
   el.resultCanvas.height = canvas.height;
   el.resultCanvas.getContext('2d').drawImage(canvas, 0, 0);
 }
+
+// A pick made just before switching screens may still be rendering.
+watch((s) => s.renderBuffer, (buffer) => { if (buffer && !el.screens.result.hidden) renderResult(); });
+watch((s) => s.status === 'rendering', (rendering) => { $('btn-download').disabled = rendering; });
 
 $('btn-download').addEventListener('click', () => {
   composite(el.legendToggle.checked).toBlob((blob) => {

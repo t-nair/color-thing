@@ -188,6 +188,18 @@ h2 {
 .swatch input[type="text"]:focus { outline: 1px solid var(--ink); border-color: var(--ink); }
 .swatch input[type="text"].invalid { border-color: var(--danger); color: var(--danger); }
 
+/* Detected colour; click to reset the pick back to it. */
+.swatch-reset {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.swatch-reset:hover { border-color: var(--ink); }
+
 /* --- buttons --- */
 
 .actions { display: flex; flex-direction: column; gap: 8px; margin-top: 32px; }

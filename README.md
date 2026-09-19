@@ -24,7 +24,43 @@ any static host.
 | `styles.css` | All styling |
 | `src/color.js` | sRGB ↔ CIE Lab (D65) and hex helpers |
 | `src/pipeline.js` | The CV pipeline — isolation, clustering, cleanup, recolor |
-| `src/app.js` | UI wiring, legend rendering, PNG export |
+| `src/store.js` | Central store: state, reducer, `subscribe`/`dispatch`, `watch` |
+| `src/cv-service.js` | CV observers (analysis, recolor) and the worker client |
+| `src/cv.worker.js` | Web Worker that runs the pipeline off the main thread |
+| `src/cv-session.js` | Keeps one photo's analysis between analyze and recolor calls |
+| `src/color-editor.js` | Swatch rows; every edit dispatches `UPDATE_TARGET` |
+| `src/canvas-renderer.js` | Paints `renderBuffer` to the preview canvas |
+| `src/app.js` | Bootstrapping, screens, upload, legend rendering, PNG export |
+
+## State and data flow
+
+The UI and the CV math never call each other. All state lives in one store
+(`src/store.js`); components subscribe to the slice they care about and
+dispatch results back:
+
+| Observer | Watches | Does | Dispatches |
+|---|---|---|---|
+| CV analysis | `rawImage` | Forward Lab, isolation, clustering (in the worker) | `ANALYSIS_COMPLETE` |
+| CV recolor | `targets` | Pixel swap + inverse Lab over the existing mask (in the worker) | `RENDER_BUFFER_READY` |
+| Color editor | `sourceSwatches` | Builds a row per detected colour | `UPDATE_TARGET` |
+| Canvas renderer | `renderBuffer` | `putImageData` to the preview canvas | — |
+
+State: `rawImage`, `maskData` (feathered garment alpha), `sourceSwatches`,
+`targetHex` (the most recent pick) and `renderBuffer`, plus:
+
+- `targets` — one pick per swatch. Regions recolor independently, so a single
+  `targetHex` isn't enough to render from; `UPDATE_TARGET` takes
+  `{ index, hex }` and sets both. Recolor watches `targets` rather than
+  `targetHex`, since the same hex picked for a second region must still render.
+- `settings` (`{ k, onModel }`, via `SET_OPTIONS`), `analysisMeta` (per-swatch
+  share and the isolation warning), `status` and `error` (`PIPELINE_ERROR`).
+
+The label map and per-region anchors that recolor needs stay inside the worker
+(`cv-session.js`) — the store only ever holds what the UI renders. Each new
+photo bumps a generation counter, so results for a replaced photo are dropped,
+and recolor keeps at most one request in flight, coalescing a colour-picker
+drag into a single rerun with the latest picks. If a module worker can't be
+started, the same session runs on the main thread.
 
 ## How the pipeline works
 
@@ -42,22 +78,31 @@ any static host.
    then cut away. Skin classification does the removing — hue in the Lab a/b
    plane (permissive on lightness, since across skin tones melanin moves L and
    chroma far more than hue) combined with smoothness, because beige and camel
-   garments sit in the skin gamut and only texture tells knit from arm. Sobel
-   edges are the supporting cue: they make the cut land on the real
-   neckline/cuff/hem and stop the garment bleeding into hair or trousers. The
-   largest surviving component is the garment. If that comes out under 10% of
-   the person, the detector has eaten a skin-toned garment, so it falls back to
-   the whole subject and returns a `warning`.
+   garments sit in the skin gamut and only texture tells knit from arm. The
+   person's skin tone is estimated from large connected skin areas only, and
+   small patches are dropped from the final skin mask: real skin forms a few
+   big regions (face, neck, hands), while skin-toned false positives on fabric
+   are scattered, and letting them into the estimate drags it toward the
+   garment. Sobel edges are the supporting cue: they make the cut land on the
+   real neckline/cuff/hem and stop the garment bleeding into hair or trousers.
+   A knit's own stitch gradients can dice it into confetti, though, so if the
+   largest piece left after the edge cut is under 40% of what the cut kept, the
+   cut is dropped and the garment is separated on skin alone. The largest
+   surviving component is the garment. If that comes out under 10% of the
+   person, it falls back to the largest non-skin component — never the whole
+   subject, which would recolor the model — and returns a `warning`.
 
-2. **Identification** (PRD 6.3) — k-means with `k = X` on `(a, b, λ·hp)`, where
-   `hp = L − localMeanL`. Chrominance alone is lighting-invariant but cannot
-   separate tone-on-tone colours — gold yarn against a brown pattern, grey
-   against charcoal — which differ almost entirely in lightness. Subtracting a
-   *local* mean strips the smooth lighting gradient while keeping
-   high-frequency pattern contrast, so both properties hold at once. `λ = 0`
-   (`HP_WEIGHT`) reduces to chrominance-only, and on a solid-colour garment
-   `hp ≈ 0` everywhere. Seeding is k-means++ with a fixed seed, so the same
-   photo and X always give the same regions.
+2. **Identification** (PRD 6.3) — k-means with `k = X` on chrominance `(a, b)`
+   only, which is lighting-invariant. Seeding is k-means++ with a fixed seed,
+   so the same photo and X always give the same regions.
+
+   The clusterer also accepts a third feature, `λ·hp` with
+   `hp = L − localMeanL` (`HP_WEIGHT` in `src/pipeline.js`), meant to separate
+   tone-on-tone colours — gold yarn against a brown pattern, grey against
+   charcoal — that differ almost entirely in lightness. It is set to `λ = 0`:
+   at 0.8 it pulled skin into the garment's main cluster on real photos, so
+   faces and necks got recolored, and pattern separation got worse rather than
+   better. Raise it only with a side-by-side render showing it helps.
 
 3. **Cleanup** (PRD 6.4) — a majority filter over the label map (the
    multi-label equivalent of morphological opening/closing; unlike per-mask
@@ -117,6 +162,8 @@ would fix both.
   *smooth* fabric in a skin tone stays genuinely ambiguous to a non-AI method.
   Long hair over the shoulders against a similar-toned top can also merge, and
   skin visible through an open-knit neckline will partly survive.
+- Tone-on-tone colours (same hue, different lightness) won't separate, since
+  clustering is chrominance-only — see `HP_WEIGHT` above.
 - Busy prints, florals and gradients won't reduce to K flat regions.
 - A garment colour very close to the background is the hardest case for
   isolation; the threshold retry helps but isn't a guarantee.
@@ -139,4 +186,5 @@ On-model mode adds a Sobel pass, a box mean, extra morphology and component
 labeling, so it will be slower than the above and needs re-measuring against the
 PRD's 2 s budget. If it overruns, lower `MAX_EDGE` for the on-model path only.
 The majority filter and the flood fill dominate; both are already
-separable/linear, so the step after that would be moving analysis to a Worker.
+separable/linear. Analysis and recolor now run in a Web Worker, so these times
+no longer block the UI, though they still bound how quickly results arrive.
